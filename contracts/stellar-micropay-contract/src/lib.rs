@@ -10,6 +10,7 @@ pub struct Stream {
     pub deposited: i128,
     pub claimed: i128,
     pub start_ledger: u32,
+    pub resolved_at: Option<u64>, // Timestamp when stream was fully resolved/closed
 }
 
 #[contracttype]
@@ -89,6 +90,7 @@ impl StellarMicroPay {
             deposited: deposit,
             claimed: 0,
             start_ledger: env.ledger().sequence(),
+            resolved_at: None, // Stream starts unresolved
         };
 
         // Store the stream
@@ -120,6 +122,11 @@ impl StellarMicroPay {
             .get(&DataKey::Stream(stream_id))
             .unwrap_or_else(|| panic!("Stream not found"));
 
+        // Check if stream is already resolved
+        if stream.resolved_at.is_some() {
+            panic!("Cannot claim from a resolved stream");
+        }
+
         // Verify recipient
         if stream.recipient != recipient {
             panic!("Only the recipient can claim from this stream");
@@ -144,6 +151,12 @@ impl StellarMicroPay {
 
         // Update claimed amount
         stream.claimed += actual_claim;
+        
+        // Check if stream is fully claimed (resolved)
+        if stream.claimed >= stream.deposited {
+            stream.resolved_at = Some(env.ledger().timestamp());
+        }
+        
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
@@ -173,6 +186,11 @@ impl StellarMicroPay {
             .get(&DataKey::Stream(stream_id))
             .unwrap_or_else(|| panic!("Stream not found"));
 
+        // Check if stream is already resolved
+        if stream.resolved_at.is_some() {
+            panic!("Cannot top up a resolved stream");
+        }
+
         // Verify payer
         if stream.payer != payer {
             panic!("Only the payer can top up this stream");
@@ -180,6 +198,12 @@ impl StellarMicroPay {
 
         // Update deposited amount
         stream.deposited += amount;
+        
+        // If stream was previously fully claimed, it might become active again
+        if stream.claimed >= stream.deposited - amount {
+            stream.resolved_at = None; // Reactivate the stream
+        }
+        
         env.storage()
             .persistent()
             .set(&DataKey::Stream(stream_id), &stream);
@@ -200,7 +224,7 @@ impl StellarMicroPay {
     /// # Returns
     /// Amount refunded to payer (in stroops)
     pub fn close_stream(env: Env, stream_id: u32, payer: Address) -> i128 {
-        let stream: Stream = env
+        let mut stream: Stream = env
             .storage()
             .persistent()
             .get(&DataKey::Stream(stream_id))
@@ -211,24 +235,32 @@ impl StellarMicroPay {
             panic!("Only the payer can close this stream");
         }
 
+        // Check if stream is already resolved
+        if stream.resolved_at.is_some() {
+            panic!("Stream is already resolved");
+        }
+
         // Calculate refundable amount
         let current_ledger = env.ledger().sequence();
         let elapsed_ledgers = current_ledger.saturating_sub(stream.start_ledger);
         let total_streamed = stream.rate_per_ledger * elapsed_ledgers as i128;
         let refundable = stream.deposited - total_streamed.max(stream.claimed);
 
+        // Mark stream as resolved
+        stream.resolved_at = Some(env.ledger().timestamp());
+        
         if refundable <= 0 {
-            // Remove the stream even if no refund
+            // Update stream with resolved timestamp even if no refund
             env.storage()
                 .persistent()
-                .remove(&DataKey::Stream(stream_id));
+                .set(&DataKey::Stream(stream_id), &stream);
             return 0;
         }
 
-        // Remove the stream
+        // Update stream with resolved timestamp
         env.storage()
             .persistent()
-            .remove(&DataKey::Stream(stream_id));
+            .set(&DataKey::Stream(stream_id), &stream);
 
         // Transfer refund to payer
         env.current_contract_address().require_auth();
@@ -777,6 +809,316 @@ mod tests {
         let (env, payer, recipient, _contract_id) = setup_contract();
         
         StellarMicroPay::open_stream(&env, payer, recipient, 1000, 0);
+    }
+
+    // Tests for resolved_at functionality
+
+    #[test]
+    fn test_stream_starts_unresolved() {
+        let (env, payer, recipient, _contract_id) = setup_contract();
+        
+        let stream_id = StellarMicroPay::open_stream(
+            &env,
+            payer.clone(),
+            recipient.clone(),
+            1000,
+            1000000,
+        );
+        
+        let stream = StellarMicroPay::get_stream(&env, stream_id);
+        assert_eq!(stream.resolved_at, None); // Stream should start unresolved
+    }
+
+    #[test]
+    fn test_claim_resolves_when_fully_claimed() {
+        let (env, payer, recipient, _contract_id) = setup_contract();
+        
+        let stream_id = StellarMicroPay::open_stream(
+            &env,
+            payer.clone(),
+            recipient.clone(),
+            1000,
+            5000, // Small deposit that can be fully claimed
+        );
+        
+        // Advance ledger by 10 (should exceed deposit and fully claim)
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 10,
+            timestamp: 1000000, // Set a specific timestamp
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        let claimed = StellarMicroPay::claim_stream(&env, stream_id, recipient.clone());
+        assert_eq!(claimed, 5000); // Can only claim what was deposited
+        
+        let stream = StellarMicroPay::get_stream(&env, stream_id);
+        assert_eq!(stream.claimed, 5000);
+        assert_eq!(stream.resolved_at, Some(1000000)); // Should be resolved with timestamp
+    }
+
+    #[test]
+    fn test_partial_claim_remains_unresolved() {
+        let (env, payer, recipient, _contract_id) = setup_contract();
+        
+        let stream_id = StellarMicroPay::open_stream(
+            &env,
+            payer.clone(),
+            recipient.clone(),
+            1000,
+            1000000, // Large deposit
+        );
+        
+        // Advance ledger by 5 (partial claim)
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 5,
+            timestamp: 1000000,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        let claimed = StellarMicroPay::claim_stream(&env, stream_id, recipient.clone());
+        assert_eq!(claimed, 5000);
+        
+        let stream = StellarMicroPay::get_stream(&env, stream_id);
+        assert_eq!(stream.claimed, 5000);
+        assert_eq!(stream.resolved_at, None); // Should remain unresolved
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot claim from a resolved stream")]
+    fn test_cannot_claim_from_resolved_stream() {
+        let (env, payer, recipient, _contract_id) = setup_contract();
+        
+        let stream_id = StellarMicroPay::open_stream(
+            &env,
+            payer.clone(),
+            recipient.clone(),
+            1000,
+            5000, // Small deposit
+        );
+        
+        // Advance ledger and fully claim
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 10,
+            timestamp: 1000000,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        // First claim should succeed and resolve the stream
+        StellarMicroPay::claim_stream(&env, stream_id, recipient.clone());
+        
+        // Advance ledger further
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 15,
+            timestamp: 2000000,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        // Second claim should fail
+        StellarMicroPay::claim_stream(&env, stream_id, recipient.clone());
+    }
+
+    #[test]
+    fn test_close_stream_sets_resolved_at() {
+        let (env, payer, recipient, _contract_id) = setup_contract();
+        
+        let stream_id = StellarMicroPay::open_stream(
+            &env,
+            payer.clone(),
+            recipient.clone(),
+            1000,
+            1000000,
+        );
+        
+        // Advance ledger by 5
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 5,
+            timestamp: 1500000,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        let refund = StellarMicroPay::close_stream(&env, stream_id, payer.clone());
+        assert_eq!(refund, 995000); // 1000000 - 5000 streamed
+        
+        let stream = StellarMicroPay::get_stream(&env, stream_id);
+        assert_eq!(stream.resolved_at, Some(1500000)); // Should be resolved with timestamp
+    }
+
+    #[test]
+    #[should_panic(expected = "Stream is already resolved")]
+    fn test_cannot_close_already_resolved_stream() {
+        let (env, payer, recipient, _contract_id) = setup_contract();
+        
+        let stream_id = StellarMicroPay::open_stream(
+            &env,
+            payer.clone(),
+            recipient.clone(),
+            1000,
+            1000000,
+        );
+        
+        // Close the stream first
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 5,
+            timestamp: 1000000,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        StellarMicroPay::close_stream(&env, stream_id, payer.clone());
+        
+        // Try to close again - should fail
+        StellarMicroPay::close_stream(&env, stream_id, payer.clone());
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot top up a resolved stream")]
+    fn test_cannot_top_up_resolved_stream() {
+        let (env, payer, recipient, _contract_id) = setup_contract();
+        
+        let stream_id = StellarMicroPay::open_stream(
+            &env,
+            payer.clone(),
+            recipient.clone(),
+            1000,
+            1000000,
+        );
+        
+        // Close the stream first
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 5,
+            timestamp: 1000000,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        StellarMicroPay::close_stream(&env, stream_id, payer.clone());
+        
+        // Try to top up - should fail
+        StellarMicroPay::top_up_stream(&env, stream_id, payer.clone(), 500000);
+    }
+
+    #[test]
+    fn test_top_up_reactivates_fully_claimed_stream() {
+        let (env, payer, recipient, _contract_id) = setup_contract();
+        
+        let stream_id = StellarMicroPay::open_stream(
+            &env,
+            payer.clone(),
+            recipient.clone(),
+            1000,
+            5000, // Small deposit
+        );
+        
+        // Advance ledger and fully claim (this should resolve the stream)
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 10,
+            timestamp: 1000000,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        StellarMicroPay::claim_stream(&env, stream_id, recipient.clone());
+        
+        // Verify stream is resolved
+        let stream = StellarMicroPay::get_stream(&env, stream_id);
+        assert_eq!(stream.resolved_at, Some(1000000));
+        assert_eq!(stream.claimed, 5000);
+        
+        // Top up should reactivate the stream
+        StellarMicroPay::top_up_stream(&env, stream_id, payer.clone(), 10000);
+        
+        let stream = StellarMicroPay::get_stream(&env, stream_id);
+        assert_eq!(stream.resolved_at, None); // Should be reactivated (unresolved)
+        assert_eq!(stream.deposited, 15000); // 5000 + 10000
+        assert_eq!(stream.claimed, 5000); // Claimed amount unchanged
+    }
+
+    #[test]
+    fn test_protocol_invariants_after_resolution() {
+        let (env, payer, recipient, _contract_id) = setup_contract();
+        
+        let stream_id = StellarMicroPay::open_stream(
+            &env,
+            payer.clone(),
+            recipient.clone(),
+            1000,
+            10000,
+        );
+        
+        // Advance ledger and make partial claims
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 5,
+            timestamp: 1000000,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        StellarMicroPay::claim_stream(&env, stream_id, recipient.clone());
+        
+        // Advance more and fully claim
+        env.ledger().set(LedgerInfo {
+            protocol_version: 20,
+            sequence_number: 15,
+            timestamp: 2000000,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 10,
+            min_persistent_entry_ttl: 10,
+            max_entry_ttl: 3110400,
+        });
+        
+        StellarMicroPay::claim_stream(&env, stream_id, recipient.clone());
+        
+        let stream = StellarMicroPay::get_stream(&env, stream_id);
+        
+        // Verify protocol invariants
+        assert!(stream.claimed <= stream.deposited); // Never claim more than deposited
+        assert!(stream.claimed >= 0); // Claimed amount is non-negative
+        assert!(stream.deposited >= 0); // Deposited amount is non-negative
+        assert!(stream.rate_per_ledger > 0); // Rate is positive
+        assert!(stream.resolved_at.is_some()); // Stream should be resolved
+        assert_eq!(stream.claimed, stream.deposited); // Fully claimed
     }
 
     // Zero-Knowledge Proof Tests

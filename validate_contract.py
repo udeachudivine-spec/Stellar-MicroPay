@@ -20,11 +20,11 @@ def validate_contract():
         content = f.read()
     
     # Check for required struct definition
-    stream_struct_pattern = r'pub struct Stream\s*\{[^}]+payer:\s*Address[^}]+recipient:\s*Address[^}]+rate_per_ledger:\s*i128[^}]+deposited:\s*i128[^}]+claimed:\s*i128[^}]+start_ledger:\s*u32[^}]+\}'
+    stream_struct_pattern = r'pub struct Stream\s*\{[^}]+payer:\s*Address[^}]+recipient:\s*Address[^}]+rate_per_ledger:\s*i128[^}]+deposited:\s*i128[^}]+claimed:\s*i128[^}]+start_ledger:\s*u32[^}]+resolved_at:\s*Option<u64>[^}]+\}'
     if not re.search(stream_struct_pattern, content, re.DOTALL):
-        print("❌ Stream struct not properly defined")
+        print("❌ Stream struct not properly defined with resolved_at field")
         return False
-    print("✅ Stream struct properly defined")
+    print("✅ Stream struct properly defined with resolved_at field")
     
     # Check for required functions
     required_functions = [
@@ -97,7 +97,17 @@ def validate_contract():
         'test_unauthorized_claim',
         'test_unauthorized_close',
         'test_invalid_rate',
-        'test_invalid_deposit'
+        'test_invalid_deposit',
+        # New tests for resolved_at functionality
+        'test_stream_starts_unresolved',
+        'test_claim_resolves_when_fully_claimed',
+        'test_partial_claim_remains_unresolved',
+        'test_cannot_claim_from_resolved_stream',
+        'test_close_stream_sets_resolved_at',
+        'test_cannot_close_already_resolved_stream',
+        'test_cannot_top_up_resolved_stream',
+        'test_top_up_reactivates_fully_claimed_stream',
+        'test_protocol_invariants_after_resolution'
     ]
     
     for test in test_functions:
@@ -106,6 +116,22 @@ def validate_contract():
             print(f"❌ Test function missing: {test}")
             return False
         print(f"✅ Test function {test} found")
+    
+    # Check for resolved_at specific logic
+    resolved_at_patterns = [
+        r'resolved_at:\s*None',  # Initialize as None
+        r'stream\.resolved_at\.is_some\(\)',  # Check if resolved
+        r'stream\.resolved_at\s*=\s*Some\(env\.ledger\(\)\.timestamp\(\)\)',  # Set resolved timestamp
+        r'Cannot claim from a resolved stream',  # Error message
+        r'Stream is already resolved',  # Error message
+        r'Cannot top up a resolved stream'  # Error message
+    ]
+    
+    for pattern in resolved_at_patterns:
+        if not re.search(pattern, content):
+            print(f"❌ resolved_at logic missing: {pattern}")
+            return False
+    print("✅ resolved_at logic properly implemented")
     
     print("\n🎉 All validation checks passed!")
     return True
